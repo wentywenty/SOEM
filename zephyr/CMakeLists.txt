@@ -5,4 +5,4 @@ project(soem_sample)
 target_sources(app PRIVATE main.c)
 
 # 包含 SOEM 库的构建定义
-include(soem.cmake)
+# include(soem.cmake)
