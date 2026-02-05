@@ -1,8 +1,23 @@
-#ifndef _OSHW_H_
-#define _OSHW_H_
-#include <zephyr/sys/byteorder.h>
-#define oshw_htons(x) sys_cpu_to_be16(x)
-#define oshw_ntohs(x) sys_be16_to_cpu(x)
-#define oshw_htonl(x) sys_cpu_to_be32(x)
-#define oshw_ntohl(x) sys_be32_to_cpu(x)
+#ifndef _OSHW_ZEPHYR_H_
+#define _OSHW_ZEPHYR_H_
+
+#include "osal.h"
+#include <soem/ec_type.h>
+
+#ifdef __cplusplus
+extern "C" {
 #endif
+
+/* Forward declaration for ec_adaptert */
+typedef struct ec_adapter ec_adaptert;
+
+uint16 oshw_htons(const uint16 host);
+uint16 oshw_ntohs(const uint16 network);
+ec_adaptert *oshw_find_adapters(void);
+void oshw_free_adapters(ec_adaptert *adapter);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* _OSHW_ZEPHYR_H_ */
