@@ -31,7 +31,7 @@
  * This layer is fully transparent for the higher layers.
  */
 
-#include <kern/kern.h>
+#include <zephyr/kernel.h>
 #include <drivers/ioctl.h>
 #include <string.h>
 

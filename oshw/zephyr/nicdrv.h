@@ -1,18 +1,24 @@
 /*
- * This software is dual-licensed under GPLv3 and a commercial
- * license. See the file LICENSE.md distributed with this software for
- * full license information.
- */
-
-/** \file
- * \brief
- * Headerfile for nicdrv.c
+ * Zephyr specific nicdrv.h
+ *
+ * Replaces the minimal stub with a full definition compatible with
+ * SOEM core files.
  */
 
 #ifndef _nicdrvh_
 #define _nicdrvh_
 
 #include <zephyr/kernel.h>
+#include <soem/ec_type.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/*
+ * ec_bufT, EC_MAXBUF exist in ec_type.h/ec_config.h,
+ * usually included before this file in SOEM.
+ */
 
 /** pointer structure to Tx and Rx stacks */
 typedef struct
@@ -79,9 +85,14 @@ typedef struct
    int redstate;
    /** pointer to redundancy port and buffers */
    ecx_redportt *redport;
-   mtx_t *getindex_mutex;
-   mtx_t *tx_mutex;
-   mtx_t *rx_mutex;
+
+   /* Zephyr mutexes replacing pthread_mutex_t */
+   struct k_mutex getindex_mutex;
+   struct k_mutex tx_mutex;
+   struct k_mutex rx_mutex;
+
+   /* Zephyr specific interface handle */
+   void *iface;
 } ecx_portt;
 
 extern const uint16 priMAC[3];
@@ -92,9 +103,13 @@ int ecx_setupnic(ecx_portt *port, const char *ifname, int secondary);
 int ecx_closenic(ecx_portt *port);
 void ecx_setbufstat(ecx_portt *port, uint8 idx, int bufstat);
 uint8 ecx_getindex(ecx_portt *port);
-int ecx_outframe(ecx_portt *port, uint8 idx, int stacknumber);
+int ecx_outframe(ecx_portt *port, uint8 idx, int sock);
 int ecx_outframe_red(ecx_portt *port, uint8 idx);
 int ecx_waitinframe(ecx_portt *port, uint8 idx, int timeout);
 int ecx_srconfirm(ecx_portt *port, uint8 idx, int timeout);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

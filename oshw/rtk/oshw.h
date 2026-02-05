@@ -16,7 +16,7 @@
 extern "C" {
 #endif
 
-#include <kern/kern.h>
+#include <zephyr/kernel.h>
 #include "soem/soem.h"
 #include "nicdrv.h"
 

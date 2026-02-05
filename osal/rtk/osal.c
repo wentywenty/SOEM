@@ -5,7 +5,7 @@
  */
 
 #include <osal.h>
-#include <kern/kern.h>
+#include <zephyr/kernel.h>
 
 void osal_get_monotonic_time(ec_timet *tv)
 {
