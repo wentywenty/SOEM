@@ -125,8 +125,10 @@ int oshw_mac_send(const void *payload, size_t tot_len)
 
    if (ret < 0)
    {
+      printk("OSHW: send failed ret=%d errno=%d\n", ret, errno);
       return 0;
    }
+   // printk("OSHW: send success %d\n", ret);
    return ret;
 }
 
@@ -136,12 +138,17 @@ int oshw_mac_recv(void *buffer, size_t buffer_length)
 
    int ret = zsock_recv(g_sock, buffer, buffer_length, ZSOCK_MSG_DONTWAIT);
 
-   if (ret < 0)
+   if (ret > 0)
+   {
+      // printk("OSHW: recv %d bytes\n", ret);
+   }
+   else if (ret < 0)
    {
       if (errno == EAGAIN || errno == EWOULDBLOCK)
       {
          return 0;
       }
+      printk("OSHW: recv failed ret=%d errno=%d\n", ret, errno);
       return 0;
    }
 

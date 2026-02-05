@@ -1,155 +1,383 @@
-#include <zephyr/kernel.h>
-#include <zephyr/net/socket.h>
-#include <zephyr/net/ethernet.h>
-#include <zephyr/net/net_if.h>
-#include <zephyr/sys/byteorder.h> /* 用于大小端转换 sys_cpu_to_le16 */
-
-/* EtherCAT 标准 EtherType */
-#define ECAT_ETHERTYPE 0x88A4
-
-/* EtherCAT 命令码 */
-#define EC_CMD_APRD 0x01 /* Auto Increment Physical Read */
-#define EC_CMD_BWR  0x08 /* Broadcast Write */
-
-/* 发送间隔 */
-#define SLEEP_TIME_MS 1000
-
-/* * 定义 EtherCAT 帧头结构 (2 Bytes)
- * 使用 __packed 防止编译器进行字节对齐填充
+/*
+ * This software is dual-licensed under GPLv3 and a commercial
+ * license. See the file LICENSE.md distributed with this software for
+ * full license information.
  */
-struct ec_frame_hdr {
-    uint16_t len_type;
-    /* 结构: Length(11bit) | Reserved(1bit) | Type(4bit)
-     * 注意：EtherCAT 数据内部通常是 Little Endian
-     */
-} __packed;
 
-/* * 定义 EtherCAT 子报文头结构 (10 Bytes)
- */
-struct ec_datagram_hdr {
-    uint8_t  cmd;       /* Command (e.g., APRD, BWR) */
-    uint8_t  idx;       /* Index (Sequence number) */
-    uint16_t adp;       /* Address Position (Slave Address) */
-    uint16_t ado;       /* Address Offset (Register Address) */
-    uint16_t len_c;     /* Length (11bit) + R/W/M bits */
-    uint16_t irq;       /* Interrupt / Event */
-} __packed;
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <inttypes.h>
+#include <zephyr/shell/shell.h>
+
+#include "soem/soem.h"
+
+#define EC_TIMEOUTMON 500
+
+#define NSEC_PER_SEC  1000000000
+
+static uint8 IOmap[4096];
+static OSAL_THREAD_HANDLE threadrt, thread1;
+static int expectedWKC;
+static int wkc;
+static int mappingdone, dorun, inOP, dowkccheck;
+static int currentgroup = 0;
+static int cycle = 0;
+static int64_t cycletime = 1000000;
+static bool threads_create_done = false;
+
+static ecx_contextt ctx;
+
+/* add ns to ec_timet */
+void add_time_ns(ec_timet *ts, int64 addtime)
+{
+   ec_timet addts;
+
+   addts.tv_nsec = addtime % NSEC_PER_SEC;
+   addts.tv_sec = (addtime - addts.tv_nsec) / NSEC_PER_SEC;
+   osal_timespecadd(ts, &addts, ts);
+}
+
+static float pgain = 0.01f;
+static float igain = 0.00002f;
+/* set linux sync point 500us later than DC sync, just as example */
+static int64 syncoffset = 500000;
+static int64 timeerror;
+
+/* PI calculation to get linux time synced to DC time */
+void ec_sync(int64 reftime, int64 cycletime, int64 *offsettime)
+{
+   static int64 integral = 0;
+   int64 delta;
+   delta = (reftime - syncoffset) % cycletime;
+   if (delta > (cycletime / 2))
+   {
+      delta = delta - cycletime;
+   }
+   timeerror = -delta;
+   integral += timeerror;
+   *offsettime = (int64)((timeerror * pgain) + (integral * igain));
+}
+
+/* Cyclic RT EtherCAT thread */
+OSAL_THREAD_FUNC_RT ecatthread(void)
+{
+   ec_timet ts;
+   int ht;
+   static int64_t toff = 0;
+
+   dorun = 0;
+   while (!mappingdone)
+   {
+      osal_usleep(100);
+   }
+   osal_get_monotonic_time(&ts);
+   ht = (ts.tv_nsec / 1000000) + 1; /* round to nearest ms */
+   ts.tv_nsec = ht * 1000000;
+   ecx_send_processdata(&ctx);
+   while (1)
+   {
+      /* calculate next cycle start */
+      add_time_ns(&ts, cycletime + toff);
+      /* wait to cycle start */
+      osal_monotonic_sleep(&ts);
+      if (dorun > 0)
+      {
+         cycle++;
+         wkc = ecx_receive_processdata(&ctx, EC_TIMEOUTRET);
+         if (wkc != expectedWKC)
+            dowkccheck++;
+         else
+            dowkccheck = 0;
+
+         if (ctx.slavelist[0].hasdc && (wkc > 0))
+         {
+            /* calculate toff to get linux time and DC synced */
+            ec_sync(ctx.DCtime, cycletime, &toff);
+         }
+         ecx_mbxhandler(&ctx, 0, 4);
+         ecx_send_processdata(&ctx);
+      }
+   }
+}
+
+/* Slave error handler */
+OSAL_THREAD_FUNC ecatcheck(void)
+{
+   int slaveix;
+
+   while (1)
+   {
+      if (inOP && ((dowkccheck > 2) || ctx.grouplist[currentgroup].docheckstate))
+      {
+         /* one or more slaves are not responding */
+         ctx.grouplist[currentgroup].docheckstate = FALSE;
+         ecx_readstate(&ctx);
+         for (slaveix = 1; slaveix <= ctx.slavecount; slaveix++)
+         {
+            ec_slavet *slave = &ctx.slavelist[slaveix];
+
+            if ((slave->group == currentgroup) && (slave->state != EC_STATE_OPERATIONAL))
+            {
+               ctx.grouplist[currentgroup].docheckstate = TRUE;
+               if (slave->state == (EC_STATE_SAFE_OP + EC_STATE_ERROR))
+               {
+                  printf("ERROR : slave %d is in SAFE_OP + ERROR, attempting ack.\n", slaveix);
+                  slave->state = (EC_STATE_SAFE_OP + EC_STATE_ACK);
+                  ecx_writestate(&ctx, slaveix);
+               }
+               else if (slave->state == EC_STATE_SAFE_OP)
+               {
+                  printf("WARNING : slave %d is in SAFE_OP, change to OPERATIONAL.\n", slaveix);
+                  slave->state = EC_STATE_OPERATIONAL;
+                  if (slave->mbxhandlerstate == ECT_MBXH_LOST) slave->mbxhandlerstate = ECT_MBXH_CYCLIC;
+                  ecx_writestate(&ctx, slaveix);
+               }
+               else if (slave->state > EC_STATE_NONE)
+               {
+                  if (ecx_reconfig_slave(&ctx, slaveix, EC_TIMEOUTMON) >= EC_STATE_PRE_OP)
+                  {
+                     slave->islost = FALSE;
+                     printf("MESSAGE : slave %d reconfigured\n", slaveix);
+                  }
+               }
+               else if (!slave->islost)
+               {
+                  /* re-check state */
+                  ecx_statecheck(&ctx, slaveix, EC_STATE_OPERATIONAL, EC_TIMEOUTRET);
+                  if (slave->state == EC_STATE_NONE)
+                  {
+                     slave->islost = TRUE;
+                     slave->mbxhandlerstate = ECT_MBXH_LOST;
+                     /* zero input data for this slave */
+                     if (slave->Ibytes)
+                     {
+                        memset(slave->inputs, 0x00, slave->Ibytes);
+                     }
+                     printf("ERROR : slave %d lost\n", slaveix);
+                  }
+               }
+            }
+            if (slave->islost)
+            {
+               if (slave->state <= EC_STATE_INIT)
+               {
+                  if (ecx_recover_slave(&ctx, slaveix, EC_TIMEOUTMON))
+                  {
+                     slave->islost = FALSE;
+                     printf("MESSAGE : slave %d recovered\n", slaveix);
+                  }
+               }
+               else
+               {
+                  slave->islost = FALSE;
+                  printf("MESSAGE : slave %d found\n", slaveix);
+               }
+            }
+         }
+         if (!ctx.grouplist[currentgroup].docheckstate)
+            printf("OK : all slaves resumed OPERATIONAL.\n");
+         dowkccheck = 0;
+      }
+      osal_usleep(10000);
+   }
+}
+
+/* Transition network to operational state */
+void ecatbringup(char *ifname)
+{
+   printk("EtherCAT Startup\n");
+   int rv = ecx_init(&ctx, ifname);
+   if (rv)
+   {
+      ecx_config_init(&ctx);
+      if (ctx.slavecount > 0)
+      {
+         ec_groupt *group = &ctx.grouplist[0];
+
+         ecx_config_map_group(&ctx, IOmap, 0);
+         expectedWKC = (group->outputsWKC * 2) + group->inputsWKC;
+         printk("%d slaves found and configured.\n", ctx.slavecount);
+
+         printk("segments : %d : %d %d %d %d\n",
+                group->nsegments,
+                group->IOsegment[0],
+                group->IOsegment[1],
+                group->IOsegment[2],
+                group->IOsegment[3]);
+
+         /* Configure distributed clocks */
+         mappingdone = 1;
+         ecx_configdc(&ctx);
+
+         /* Add all CoE slaves to cyclic mailbox handler */
+         int sdoslave = -1;
+         for (int si = 1; si <= ctx.slavecount; si++)
+         {
+            ec_slavet *slave = &ctx.slavelist[si];
+            if (slave->CoEdetails > 0)
+            {
+               ecx_slavembxcyclic(&ctx, si);
+               sdoslave = si;
+               printk(" Slave %d added to cyclic mailbox handler\n", si);
+            }
+         }
+
+         /* Let network sync to clocks */
+         dorun = 1;
+         osal_usleep(1000000);
+
+         /* Go to operational state */
+         ctx.slavelist[0].state = EC_STATE_OPERATIONAL;
+         ecx_writestate(&ctx, 0);
+         ecx_statecheck(&ctx, 0, EC_STATE_OPERATIONAL, EC_TIMEOUTSTATE);
+
+         if (ctx.slavelist[0].state != EC_STATE_OPERATIONAL)
+         {
+            ecx_readstate(&ctx);
+            for (int si = 1; si <= ctx.slavecount; si++)
+            {
+               ec_slavet *slave = &ctx.slavelist[si];
+               if (slave->state != EC_STATE_OPERATIONAL)
+               {
+                  printk("Slave %d State=0x%2.2x StatusCode=0x%4.4x : %s\n",
+                         si,
+                         slave->state,
+                         slave->ALstatuscode,
+                         ec_ALstatuscode2string(slave->ALstatuscode));
+               }
+            }
+         }
+         else
+         {
+            int size;
+
+            printk("EtherCAT OP\n");
+            inOP = TRUE;
+
+            /* acyclic loop 5000 x 20ms = 100s */
+            for (int i = 0; i < 5000; i++)
+            {
+               printk("Processdata cycle %5d , Wck %3d, DCtime %12" PRId64 ", dt %8" PRId64 ", O:",
+                      cycle,
+                      wkc,
+                      ctx.DCtime,
+                      timeerror);
+
+               size = group->Obytes < 8 ? group->Obytes : 8;
+               for (int j = 0; j < size; j++)
+               {
+                  printk(" %2.2x", *(ctx.slavelist[0].outputs + j));
+               }
+
+               printk(" I:");
+               size = group->Ibytes < 8 ? group->Ibytes : 8;
+               for (int j = 0; j < size; j++)
+               {
+                  printk(" %2.2x", *(ctx.slavelist[0].inputs + j));
+               }
+
+               printk("\r");
+
+               /* Demonstrate SDO access from other threads */
+               uint32_t value = 0;
+               int size_sdo = sizeof(value);
+               if (sdoslave > 0)
+               {
+                  value = 0;
+                  int sdo_wkc = ecx_SDOread(&ctx, sdoslave, 0x1018, 0x02, FALSE, &size_sdo, &value, EC_TIMEOUTRXM);
+                  (void)sdo_wkc;
+               }
+
+               osal_usleep(20000);
+            }
+            printk("\n");
+            dorun = 0;
+            inOP = FALSE;
+         }
+
+         /* Go to SAFE_OP */
+         printk("EtherCAT to SAFE_OP\n");
+         ctx.slavelist[0].state = EC_STATE_SAFE_OP;
+         ecx_writestate(&ctx, 0);
+         ecx_statecheck(&ctx, 0, EC_STATE_SAFE_OP, EC_TIMEOUTSTATE);
+
+         /* Go to INIT state */
+         printk("EtherCAT to INIT\n");
+         ctx.slavelist[0].state = EC_STATE_INIT;
+         ecx_writestate(&ctx, 0);
+         ecx_statecheck(&ctx, 0, EC_STATE_INIT, EC_TIMEOUTSTATE);
+      }
+      else
+      {
+         // Explicitly print warning using shell print if possible, or kernel print
+         printk("No slaves found!\n");
+      }
+      ecx_close(&ctx);
+   }
+   else
+   {
+      printk("No socket connection on %s\n", ifname);
+   }
+}
+
+static void ensure_threads_started(void)
+{
+   if (!threads_create_done)
+   {
+      /* create process data thread */
+      osal_thread_create_rt(&threadrt, 128000, &ecatthread, NULL);
+      /* create thread to handle slave error handling in OP */
+      osal_thread_create(&thread1, 128000, &ecatcheck, NULL);
+      threads_create_done = true;
+   }
+}
+
+/* Command handler for 'soem run' */
+static int cmd_soem_run(const struct shell *sh, size_t argc, char **argv)
+{
+   char *ifname = argv[1];
+
+   if (argc > 2)
+   {
+      cycletime = atoi(argv[2]) * 1000;
+   }
+
+   ensure_threads_started();
+
+   shell_print(sh, "Starting SOEM on interface %s with cycle time %" PRId64 " ns", ifname, cycletime);
+
+   ecatbringup(ifname);
+
+   return 0;
+}
+
+/* Command handler for 'soem adapters' */
+static int cmd_soem_adapters(const struct shell *sh, size_t argc, char **argv)
+{
+   ec_adaptert *adapter = NULL;
+   ec_adaptert *head = NULL;
+
+   shell_print(sh, "Available adapters:");
+   head = adapter = ec_find_adapters();
+   while (adapter != NULL)
+   {
+      shell_print(sh, "    - %s  (%s)", adapter->name, adapter->desc);
+      adapter = adapter->next;
+   }
+   ec_free_adapters(head);
+   return 0;
+}
+
+SHELL_STATIC_SUBCMD_SET_CREATE(sub_soem,
+                               SHELL_CMD(run, NULL, "Run SOEM: run <ifname> [cycletime_us]", cmd_soem_run),
+                               SHELL_CMD(adapters, NULL, "List adapters", cmd_soem_adapters),
+                               SHELL_SUBCMD_SET_END);
+
+SHELL_CMD_REGISTER(soem, &sub_soem, "SOEM commands", NULL);
 
 int main(void)
 {
-    int sock;
-    int ret;
-    struct sockaddr_ll src_addr;
-    struct sockaddr_ll dst_addr;
-    struct net_if *iface;
-
-    printk("Starting EtherCAT Master Sender...\n");
-
-    /* 1. 获取接口 */
-    iface = net_if_get_default();
-    if (!iface) {
-        printk("Error: No default interface.\n");
-        return 0;
-    }
-
-    /* 2. 创建 Socket */
-    sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
-    if (sock < 0) {
-        printk("Failed to create socket: %d\n", -errno);
-        return 0;
-    }
-
-    /* 3. 绑定 Bind */
-    memset(&src_addr, 0, sizeof(src_addr));
-    src_addr.sll_family = AF_PACKET;
-    src_addr.sll_ifindex = net_if_get_by_iface(iface);
-    if (bind(sock, (struct sockaddr *)&src_addr, sizeof(src_addr)) < 0) {
-        printk("Bind failed: %d\n", -errno);
-        return 0;
-    }
-
-    /* 4. 准备目标地址 (Sendto 需要) */
-    memset(&dst_addr, 0, sizeof(dst_addr));
-    dst_addr.sll_family = AF_PACKET;
-    dst_addr.sll_ifindex = net_if_get_by_iface(iface);
-    dst_addr.sll_protocol = htons(ETH_P_ALL);
-
-    /* --- 构建 EtherCAT 包 --- */
-
-    /* 定义缓冲区 (最大 MTU) */
-    uint8_t buffer[1514];
-    memset(buffer, 0, sizeof(buffer));
-
-    /* 指针映射 */
-    struct net_eth_hdr *eth = (struct net_eth_hdr *)buffer;
-    struct ec_frame_hdr *ec_frame = (struct ec_frame_hdr *)(buffer + sizeof(struct net_eth_hdr));
-    struct ec_datagram_hdr *ec_dgram = (struct ec_datagram_hdr *)(buffer + sizeof(struct net_eth_hdr) + sizeof(struct ec_frame_hdr));
-
-    /* 负载数据区指针 (紧接在子报文头后面) */
-    uint8_t *dgram_data = (uint8_t *)ec_dgram + sizeof(struct ec_datagram_hdr);
-    /* WKC 指针 (紧接在数据后面) */
-    uint16_t *wkc;
-
-    /* 设置要读取的数据长度 (例如读取 4 字节的 Vendor ID) */
-    uint16_t data_len = 4;
-
-    /* A. 填充 Ethernet Header */
-    /* EtherCAT 广播通常发往 FF:FF:FF:FF:FF:FF，或者是第一个从站 */
-    memset(&eth->dst, 0xFF, 6);
-    struct net_linkaddr *ll_addr = net_if_get_link_addr(iface);
-    memcpy(&eth->src, ll_addr->addr, 6);
-    eth->type = htons(ECAT_ETHERTYPE); /* 0x88A4 Big Endian */
-
-    /* B. 填充 EtherCAT 子报文 (Datagram) */
-    ec_dgram->cmd = EC_CMD_APRD; /* APRD: 自动增量读取 */
-    ec_dgram->idx = 0x01;        /* 帧序号 */
-
-    /* ADP: 对于 APRD，0x0000 表示第一个从站，-1 (0xFFFF) 表示第二个，以此类推 */
-    ec_dgram->adp = sys_cpu_to_le16(0x0000);
-
-    /* ADO: 寄存器地址。例如 0x0000 是 Type/Revision */
-    ec_dgram->ado = sys_cpu_to_le16(0x0000);
-
-    /* Length: 11bit 长度。最高位是 M (More) bit，这里是最后一个报文，所以为 0 */
-    ec_dgram->len_c = sys_cpu_to_le16(data_len);
-
-    ec_dgram->irq = 0x0000;
-
-    /* 初始化数据区为 0 (等待从站填充) */
-    memset(dgram_data, 0, data_len);
-
-    /* C. 处理 Working Counter (WKC) */
-    /* WKC 位于数据之后，2字节 */
-    wkc = (uint16_t *)(dgram_data + data_len);
-    *wkc = 0x0000; // 初始化为0
-
-    /* D. 填充 EtherCAT 帧头 */
-    /* 计算 EtherCAT 负载总长度 = Datagram Header + Data + WKC */
-    uint16_t ec_payload_len = sizeof(struct ec_datagram_hdr) + data_len + 2;
-
-    /* Frame Header = Length(11bit) | Reserved(1bit) | Type(4bit)
-     * Type 1 = EtherCAT Commands
-     * 组合方式: Length | (Type << 12)
-     */
-    uint16_t hdr_val = ec_payload_len | (1 << 12);
-    ec_frame->len_type = sys_cpu_to_le16(hdr_val); /* 必须转为小端 */
-
-    /* 计算最终发送的总字节数 */
-    size_t total_len = sizeof(struct net_eth_hdr) + sizeof(struct ec_frame_hdr) + ec_payload_len;
-
-    while (1) {
-        ret = sendto(sock, buffer, total_len, 0,
-                     (const struct sockaddr *)&dst_addr, sizeof(dst_addr));
-
-        if (ret < 0) {
-            printk("Send failed: %d\n", -errno);
-        } else {
-            printk("Sent EtherCAT frame (%d bytes). Idx: %d\n", ret, ec_dgram->idx);
-            /* 每次发送增加序号，方便 Wireshark 观察 */
-            ec_dgram->idx++;
-        }
-
-        k_msleep(SLEEP_TIME_MS);
-    }
-    return 0;
+   printf("SOEM shell app ready. Use 'soem' command.\n");
+   return 0;
 }
